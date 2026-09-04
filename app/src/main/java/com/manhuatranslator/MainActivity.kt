@@ -30,8 +30,8 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
@@ -44,6 +44,11 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+data class OcrBlock(val text: String, val box: Rect, val confidence: Float, val script: Script)
+enum class Script { CHINESE, JAPANESE, KOREAN, LATIN, UNKNOWN }
+data class Region(val box: Rect, val text: String, val confidence: Float, val script: Script)
+data class OcrCandidate(val script: Script, val angle: Int, val blocks: List<OcrBlock>, val score: Double)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,226 +56,265 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class OcrBlock(val text: String, val box: Rect, val confidence: Float, val script: Script)
-enum class Script { CHINESE, JAPANESE, KOREAN, LATIN, UNKNOWN }
-data class Region(val box: Rect, val text: String, val confidence: Float, val script: Script)
-data class Candidate(val script: Script, val blocks: List<OcrBlock>, val score: Double)
-
 private class OcrEngine : AutoCloseable {
-    private data class R(val script: Script, val client: TextRecognizer)
+    private data class Client(val script: Script, val recognizer: TextRecognizer)
     private val clients = listOf(
-        R(Script.CHINESE, TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())),
-        R(Script.JAPANESE, TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())),
-        R(Script.KOREAN, TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())),
-        R(Script.LATIN, TextRecognition.getClient(TextRecognizerOptions.Builder().build()))
+        Client(Script.CHINESE, TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())),
+        Client(Script.JAPANESE, TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())),
+        Client(Script.KOREAN, TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())),
+        Client(Script.LATIN, TextRecognition.getClient(TextRecognizerOptions.Builder().build()))
     )
 
     suspend fun recognize(bitmap: Bitmap): List<OcrBlock> {
-        val candidates = mutableListOf<Candidate>()
-        for (angle in listOf(0, 90, 270)) {
+        val candidates = mutableListOf<OcrCandidate>()
+        for (angle in intArrayOf(0, 90, 270)) {
             val rotated = if (angle == 0) bitmap else rotate(bitmap, angle)
             try {
-                for (r in clients) {
-                    val result = r.client.process(InputImage.fromBitmap(rotated, 0)).await()
-                    val blocks = result.textBlocks.flatMap { b ->
-                        b.lines.mapNotNull { line ->
+                for (client in clients) {
+                    val result = client.recognizer.process(InputImage.fromBitmap(rotated, 0)).await()
+                    val blocks = result.textBlocks.flatMap { block ->
+                        block.lines.mapNotNull { line ->
                             val text = line.text.trim()
-                            val bb = line.boundingBox ?: return@mapNotNull null
+                            val bounds = line.boundingBox ?: return@mapNotNull null
                             if (text.isEmpty()) return@mapNotNull null
-                            val box = mapBox(bb, angle, bitmap.width, bitmap.height)
-                            val confidence = line.elements.mapNotNull { element -> element.confidence }.average()
-                            val conf = confidence.toFloat().coerceIn(0f, 1f)
-                            OcrBlock(text, box, conf, r.script)
+                            val confidence = line.elements.mapNotNull { it.confidence }
+                                .takeIf { it.isNotEmpty() }?.average()?.toFloat()?.coerceIn(0f, 1f) ?: 0.5f
+                            OcrBlock(text, mapBox(bounds, angle, bitmap.width, bitmap.height), confidence, client.script)
                         }
                     }
-                    if (blocks.isNotEmpty()) candidates += Candidate(r.script, blocks, score(r.script, angle, blocks))
+                    if (blocks.isNotEmpty()) {
+                        candidates += OcrCandidate(client.script, angle, blocks, score(client.script, angle, blocks))
+                    }
                 }
             } finally {
                 if (rotated !== bitmap) rotated.recycle()
             }
         }
-        return candidates.maxByOrNull { it.score }?.blocks?.let { dedup(it) } ?: emptyList()
+        val best = candidates.maxByOrNull { it.score } ?: return emptyList()
+        return dedup(best.blocks)
     }
 
     private fun score(script: Script, angle: Int, blocks: List<OcrBlock>): Double {
-        val chars = blocks.sumOf { block -> block.text.count { c -> !c.isWhitespace() } }
+        val chars = blocks.sumOf { it.text.count { c -> !c.isWhitespace() } }.toDouble()
+        val cjk = blocks.sumOf { block -> block.text.count(::isCjk) }.toDouble()
         val conf = blocks.map { it.confidence.toDouble() }.average()
-        val cjk = blocks.sumOf { block ->
-            block.text.count { c ->
-                c.code in 0x3040..0x30ff || c.code in 0x3400..0x9fff || c.code in 0xac00..0xd7af
-            }
-        }
-        return chars.toDouble() + conf * 90.0 + min(blocks.size, 30).toDouble() * 3.0 +
-            if (script != Script.LATIN) cjk.toDouble() * 1.8 else 0.0 +
-            if (angle != 0 && script != Script.LATIN && cjk >= 2) 10.0 else 0.0
+        val cjkRatio = if (chars == 0.0) 0.0 else cjk / chars
+        val scriptBonus = if (script != Script.LATIN && cjk > 0) 35.0 else 0.0
+        val verticalBonus = if (angle != 0 && script != Script.LATIN && cjk >= 2) 15.0 else 0.0
+        val latinPenalty = if (script == Script.LATIN && cjk == 0.0) 12.0 else 0.0
+        return chars + cjk * 10.0 + conf * 50.0 + min(blocks.size, 20) * 2.0 +
+            cjkRatio * 30.0 + scriptBonus + verticalBonus - latinPenalty
     }
 
+    private fun isCjk(c: Char): Boolean =
+        c.code in 0x3040..0x30FF || c.code in 0x3400..0x9FFF || c.code in 0xAC00..0xD7AF
+
     private fun dedup(blocks: List<OcrBlock>): List<OcrBlock> =
-        blocks.sortedByDescending { it.confidence * 100f + it.text.length.toFloat() }
-            .fold(mutableListOf<OcrBlock>()) { out, b ->
-                if (out.none { existing -> overlap(existing.box, b.box) > 0.72f && norm(existing.text) == norm(b.text) }) {
-                    out += b
+        blocks.sortedByDescending { it.confidence * 100f + it.text.length }
+            .fold(mutableListOf<OcrBlock>()) { out, block ->
+                if (out.none { existing -> overlap(existing.box, block.box) > 0.72f && normalize(existing.text) == normalize(block.text) }) {
+                    out += block
                 }
                 out
             }
             .sortedWith(compareBy<OcrBlock> { it.box.top }.thenBy { it.box.left })
 
-    private fun norm(s: String) = s.lowercase().replace(Regex("\\s+"), "")
+    private fun normalize(text: String) = text.lowercase().replace(Regex("\\s+"), "")
 
     private fun overlap(a: Rect, b: Rect): Float {
-        val l = max(a.left, b.left)
-        val t = max(a.top, b.top)
-        val r = min(a.right, b.right)
-        val d = min(a.bottom, b.bottom)
-        if (r <= l || d <= t) return 0f
-        val intersection = (r - l).toLong() * (d - t).toLong()
-        val minimumArea = min(a.width().toLong() * a.height().toLong(), b.width().toLong() * b.height().toLong())
-        return if (minimumArea == 0L) 0f else intersection.toFloat() / minimumArea.toFloat()
+        val left = max(a.left, b.left)
+        val top = max(a.top, b.top)
+        val right = min(a.right, b.right)
+        val bottom = min(a.bottom, b.bottom)
+        if (right <= left || bottom <= top) return 0f
+        val intersection = (right - left).toLong() * (bottom - top).toLong()
+        val area = min(a.width().toLong() * a.height(), b.width().toLong() * b.height())
+        return if (area <= 0L) 0f else intersection.toFloat() / area.toFloat()
     }
 
-    private fun rotate(src: Bitmap, degrees: Int): Bitmap =
-        Bitmap.createBitmap(src, 0, 0, src.width, src.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
+    private fun rotate(source: Bitmap, degrees: Int): Bitmap =
+        Bitmap.createBitmap(source, 0, 0, source.width, source.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
 
-    private fun mapBox(b: Rect, angle: Int, w: Int, h: Int): Rect {
-        if (angle == 0) return Rect(b)
+    private fun mapBox(box: Rect, angle: Int, width: Int, height: Int): Rect {
+        if (angle == 0) return Rect(box)
         val points = listOf(
-            b.left to b.top, b.right to b.top, b.left to b.bottom, b.right to b.bottom
-        ).map { (x, y) -> if (angle == 90) y to h - x else w - y to x }
+            box.left to box.top, box.right to box.top,
+            box.left to box.bottom, box.right to box.bottom
+        ).map { (x, y) -> if (angle == 90) y to height - x else width - y to x }
         return Rect(
-            points.minOf { it.first }.coerceIn(0, w),
-            points.minOf { it.second }.coerceIn(0, h),
-            points.maxOf { it.first }.coerceIn(0, w),
-            points.maxOf { it.second }.coerceIn(0, h)
+            points.minOf { it.first }.coerceIn(0, width),
+            points.minOf { it.second }.coerceIn(0, height),
+            points.maxOf { it.first }.coerceIn(0, width),
+            points.maxOf { it.second }.coerceIn(0, height)
         )
     }
 
-    override fun close() { clients.forEach { it.client.close() } }
+    override fun close() = clients.forEach { it.recognizer.close() }
 }
 
 private fun group(blocks: List<OcrBlock>): List<Region> {
-    val result = mutableListOf<Region>()
-    for (b in blocks.sortedWith(compareBy<OcrBlock> { it.box.top }.thenBy { it.box.left })) {
-        val match = result.indexOfFirst { r ->
-            val gapX = max(0, max(r.box.left, b.box.left) - min(r.box.right, b.box.right))
-            val gapY = max(0, max(r.box.top, b.box.top) - min(r.box.bottom, b.box.bottom))
-            val alignedX = abs(r.box.centerX() - b.box.centerX()) < max(r.box.width(), b.box.width()) * 0.65f
-            val alignedY = abs(r.box.centerY() - b.box.centerY()) < max(r.box.height(), b.box.height()) * 0.65f
-            gapX < max(24, (max(r.box.width(), b.box.width()) * 0.35f).toInt()) &&
-                gapY < max(32, (max(r.box.height(), b.box.height()) * 0.8f).toInt()) &&
+    val regions = mutableListOf<Region>()
+    for (block in blocks.sortedWith(compareBy<OcrBlock> { it.box.top }.thenBy { it.box.left })) {
+        val index = regions.indexOfFirst { region ->
+            val gapX = max(0, max(region.box.left, block.box.left) - min(region.box.right, block.box.right)).toFloat()
+            val gapY = max(0, max(region.box.top, block.box.top) - min(region.box.bottom, block.box.bottom)).toFloat()
+            val alignedX = abs(region.box.centerX() - block.box.centerX()) < max(region.box.width(), block.box.width()).toFloat() * 0.65f
+            val alignedY = abs(region.box.centerY() - block.box.centerY()) < max(region.box.height(), block.box.height()).toFloat() * 0.65f
+            gapX < max(24f, max(region.box.width(), block.box.width()).toFloat() * 0.35f) &&
+                gapY < max(32f, max(region.box.height(), block.box.height()).toFloat() * 0.8f) &&
                 (alignedX || alignedY)
         }
-        if (match < 0) {
-            result += Region(Rect(b.box), b.text, b.confidence, b.script)
+        if (index < 0) {
+            regions += Region(Rect(block.box), block.text, block.confidence, block.script)
         } else {
-            val old = result[match]
-            val union = Rect(old.box)
-            union.union(b.box)
-            result[match] = Region(union, old.text + " " + b.text, min(old.confidence, b.confidence), old.script)
+            val old = regions[index]
+            val union = Rect(old.box).apply { union(block.box) }
+            regions[index] = Region(union, "${old.text} ${block.text}".trim(), min(old.confidence, block.confidence), old.script)
         }
     }
-    return result
+    return regions
 }
 
 private class TranslatorPool : AutoCloseable {
-    private val cache = mutableMapOf<String, Translator>()
+    private val translators = mutableMapOf<String, Translator>()
 
     suspend fun translate(text: String, source: String): String {
         val key = "$source>pt"
-        val translator = cache.getOrPut(key) {
-            Translation.getClient(
-                TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage("pt").build()
-            )
+        val translator = translators.getOrPut(key) {
+            Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage("pt").build())
         }
-        translator.downloadModelIfNeeded(DownloadConditions.Builder().requireWifi().build()).await()
-        return translator.translate(text).await()
+        translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
+        return translator.translate(text).await().trim()
     }
 
     override fun close() {
-        cache.values.forEach { it.close() }
-        cache.clear()
+        translators.values.forEach { it.close() }
+        translators.clear()
     }
 }
 
-private fun render(original: Bitmap, regions: List<Pair<Region, String>>): Bitmap {
-    val out = original.copy(Bitmap.Config.ARGB_8888, true)
-    val canvas = Canvas(out)
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.create("sans", Typeface.NORMAL) }
-    for ((r, translation) in regions) {
-        if (translation.isBlank()) continue
-        val box = RectF(r.box)
-        val pad = max(8f, min(box.width(), box.height()) * 0.12f)
-        box.inset(-pad, -pad)
-        box.left = max(0f, box.left)
-        box.top = max(0f, box.top)
-        box.right = min(out.width.toFloat(), box.right)
-        box.bottom = min(out.height.toFloat(), box.bottom)
-        val sample = sampleBackground(original, r.box)
-        val path = Path().apply { addOval(box, Path.Direction.CW) }
-        canvas.save()
-        canvas.clipPath(path)
-        paint.color = sample
-        canvas.drawOval(box, paint)
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = if (luma(sample) > 145) Color.BLACK else Color.WHITE
-            typeface = Typeface.create("sans", Typeface.NORMAL)
-        }
-        var size = (r.box.height() * 0.32f).coerceIn(14f, 64f)
-        val maxW = box.width() * 0.82f
-        val maxH = box.height() * 0.82f
-        var lines: List<String>
-        while (true) {
-            textPaint.textSize = size
-            lines = wrap(translation, textPaint, maxW)
-            val lineHeight = textPaint.fontMetrics.run { bottom - top }
-            if (lines.size * lineHeight <= maxH || size <= 12f) break
-            size -= 1f
-        }
-        val lineHeight = textPaint.fontMetrics.run { bottom - top }
-        var y = box.centerY() - (lines.size * lineHeight) / 2f - textPaint.fontMetrics.top
-        for (line in lines) {
-            canvas.drawText(line, box.centerX() - textPaint.measureText(line) / 2f, y, textPaint)
-            y += lineHeight
-        }
-        canvas.restore()
+private fun render(original: Bitmap, translated: List<Pair<Region, String>>): Bitmap {
+    val output = original.copy(Bitmap.Config.ARGB_8888, true)
+    val canvas = Canvas(output)
+    for ((region, text) in translated) {
+        if (text.isBlank()) continue
+        val sourceBox = RectF(region.box)
+        val expansionX = max(18f, sourceBox.width() * 0.55f)
+        val expansionY = max(28f, sourceBox.height() * 1.35f)
+        val balloon = RectF(
+            max(0f, sourceBox.left - expansionX),
+            max(0f, sourceBox.top - expansionY),
+            min(output.width.toFloat(), sourceBox.right + expansionX),
+            min(output.height.toFloat(), sourceBox.bottom + expansionY)
+        )
+        val background = sampleBackground(original, region.box)
+        eraseOriginalText(canvas, original, region.box, background)
+        fillBackground(canvas, original, balloon, background)
+        drawTranslation(canvas, balloon, text, background)
     }
-    return out
+    return output
 }
 
-private fun sampleBackground(b: Bitmap, r: Rect): Int {
+private fun eraseOriginalText(canvas: Canvas, original: Bitmap, box: Rect, background: Int) {
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    val threshold = 85
+    val left = box.left.coerceIn(0, original.width)
+    val top = box.top.coerceIn(0, original.height)
+    val right = box.right.coerceIn(0, original.width)
+    val bottom = box.bottom.coerceIn(0, original.height)
+    for (y in top until bottom) {
+        for (x in left until right) {
+            val color = original.getPixel(x, y)
+            if (colorDistance(color, background) > threshold) {
+                paint.color = background
+                canvas.drawPoint(x.toFloat(), y.toFloat(), paint)
+            }
+        }
+    }
+}
+
+private fun fillBackground(canvas: Canvas, original: Bitmap, box: RectF, background: Int) {
+    val path = Path().apply { addOval(box, Path.Direction.CW) }
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = background }
+    canvas.save()
+    canvas.clipPath(path)
+    val left = box.left.toInt().coerceAtLeast(0)
+    val top = box.top.toInt().coerceAtLeast(0)
+    val right = box.right.toInt().coerceAtMost(original.width)
+    val bottom = box.bottom.toInt().coerceAtMost(original.height)
+    for (y in top until bottom step 2) {
+        for (x in left until right step 2) {
+            if (colorDistance(original.getPixel(x, y), background) < 48) {
+                canvas.drawRect(x.toFloat(), y.toFloat(), x + 2f, y + 2f, paint)
+            }
+        }
+    }
+    canvas.restore()
+}
+
+private fun drawTranslation(canvas: Canvas, box: RectF, text: String, background: Int) {
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = if (luma(background) > 150.0) Color.BLACK else Color.WHITE
+        typeface = Typeface.create("sans", Typeface.NORMAL)
+    }
+    val maxWidth = box.width() * 0.76f
+    val maxHeight = box.height() * 0.62f
+    var size = (box.height() * 0.30f).coerceIn(18f, 72f)
+    var lines: List<String>
+    while (true) {
+        paint.textSize = size
+        lines = wrapText(text, paint, maxWidth)
+        val lineHeight = paint.fontMetrics.bottom - paint.fontMetrics.top
+        if (lines.size * lineHeight <= maxHeight || size <= 12f) break
+        size -= 1f
+    }
+    val lineHeight = paint.fontMetrics.bottom - paint.fontMetrics.top
+    var y = box.centerY() - (lines.size * lineHeight) / 2f - paint.fontMetrics.top
+    for (line in lines) {
+        canvas.drawText(line, box.centerX() - paint.measureText(line) / 2f, y, paint)
+        y += lineHeight
+    }
+}
+
+private fun sampleBackground(bitmap: Bitmap, box: Rect): Int {
+    val insetX = max(1, box.width() / 4)
+    val insetY = max(1, box.height() / 4)
     val points = listOf(
-        r.left + r.width() / 4 to r.top + r.height() / 4,
-        r.right - r.width() / 4 - 1 to r.top + r.height() / 4,
-        r.centerX() to r.centerY()
+        box.left + insetX to box.top + insetY,
+        box.right - insetX - 1 to box.top + insetY,
+        box.centerX() to box.centerY()
     )
-    val colors = points.filter { it.first in 0 until b.width && it.second in 0 until b.height }
-        .map { b.getPixel(it.first, it.second) }
-    return colors.groupBy { quant(it) }.maxByOrNull { it.value.size }?.value?.firstOrNull() ?: Color.WHITE
+    val valid = points.filter { it.first in 0 until bitmap.width && it.second in 0 until bitmap.height }
+    if (valid.isEmpty()) return Color.WHITE
+    return valid.map { bitmap.getPixel(it.first, it.second) }
+        .groupBy { quantize(it) }.maxByOrNull { it.value.size }?.value?.firstOrNull() ?: Color.WHITE
 }
 
-private fun quant(c: Int) = (Color.red(c) / 16 shl 8) or (Color.green(c) / 16 shl 4) or (Color.blue(c) / 16)
-private fun luma(c: Int) = 0.299 * Color.red(c) + 0.587 * Color.green(c) + 0.114 * Color.blue(c)
+private fun colorDistance(a: Int, b: Int): Int {
+    val dr = Color.red(a) - Color.red(b)
+    val dg = Color.green(a) - Color.green(b)
+    val db = Color.blue(a) - Color.blue(b)
+    return abs(dr) + abs(dg) + abs(db)
+}
 
-private fun wrap(text: String, p: Paint, maxW: Float): List<String> {
-    val tokens = if (text.any { it.isWhitespace() }) text.split(Regex("\\s+")) else text.map { it.toString() }
+private fun quantize(color: Int) = (Color.red(color) / 16 shl 8) or (Color.green(color) / 16 shl 4) or (Color.blue(color) / 16)
+private fun luma(color: Int) = 0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)
+
+private fun wrapText(text: String, paint: Paint, maxWidth: Float): List<String> {
+    val tokens = if (text.any { it.isWhitespace() }) text.trim().split(Regex("\\s+")) else text.map { it.toString() }
     val lines = mutableListOf<String>()
     var current = ""
     for (token in tokens) {
         val candidate = if (current.isEmpty()) token else "$current $token"
-        if (p.measureText(candidate) <= maxW) {
-            current = candidate
-        } else {
+        if (paint.measureText(candidate) <= maxWidth) current = candidate
+        else {
             if (current.isNotEmpty()) lines += current
-            if (p.measureText(token) <= maxW) {
-                current = token
-            } else {
+            if (paint.measureText(token) <= maxWidth) current = token
+            else {
                 var chunk = ""
-                for (ch in token) {
-                    if (p.measureText(chunk + ch) <= maxW) {
-                        chunk += ch
-                    } else {
-                        if (chunk.isNotEmpty()) lines += chunk
-                        chunk = ch.toString()
-                    }
+                for (char in token) {
+                    if (paint.measureText(chunk + char) <= maxWidth) chunk += char
+                    else { if (chunk.isNotEmpty()) lines += chunk; chunk = char.toString() }
                 }
                 current = chunk
             }
@@ -287,18 +331,13 @@ private fun ManhuaTranslatorApp() {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
         if (it.isNotEmpty()) { pages = it; open = true }
     }
-    if (open && pages.isNotEmpty()) Reader(pages) { open = false }
-    else Home { picker.launch(arrayOf("image/*")) }
+    if (open && pages.isNotEmpty()) Reader(pages) { open = false } else Home { picker.launch(arrayOf("image/*")) }
 }
 
 @Composable
 private fun Home(onOpen: () -> Unit) {
     Scaffold(topBar = { TopAppBar(title = { Text("Manhua Translator") }) }) { padding ->
-        Column(
-            Modifier.fillMaxSize().padding(padding).padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
+        Column(Modifier.fillMaxSize().padding(padding).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             Text("Leitor de Manhua", style = MaterialTheme.typography.headlineMedium)
             Spacer(Modifier.height(12.dp))
             Text("OCR + tradução automática para português", style = MaterialTheme.typography.bodyLarge)
@@ -317,54 +356,47 @@ private fun Reader(pages: List<Uri>, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    fun run() {
+    fun translatePage() {
         if (busy) return
         scope.launch {
             busy = true
             status = "Abrindo imagem..."
             try {
-                val src = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(pages[page]).use {
-                        BitmapFactory.decodeStream(it)
-                    } ?: error("Imagem inválida")
+                val source = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(pages[page]).use { BitmapFactory.decodeStream(it) }
+                        ?: error("Imagem inválida")
                 }
                 status = "OCR em andamento..."
-                val blocks = OcrEngine().use { it.recognize(src) }
+                val blocks = OcrEngine().use { it.recognize(source) }
                 if (blocks.isEmpty()) { status = "Nenhum texto detectado."; return@launch }
                 val regions = group(blocks)
                 val script = blocks.groupingBy { it.script }.eachCount().maxByOrNull { it.value }?.key
-                val lang = when (script) {
+                val language = when (script) {
                     Script.CHINESE -> "zh"
                     Script.JAPANESE -> "ja"
                     Script.KOREAN -> "ko"
                     Script.LATIN -> "en"
                     else -> null
                 }
-                if (lang == null) { status = "Idioma não identificado."; return@launch }
+                if (language == null) { status = "Idioma não identificado."; return@launch }
                 status = "Traduzindo ${regions.size} região(ões)..."
-                val tr = TranslatorPool()
+                val pool = TranslatorPool()
                 val translated = try {
-                    regions.mapNotNull { r ->
-                        try { r to tr.translate(r.text, lang) } catch (_: Exception) { null }
-                    }
-                } finally { tr.close() }
+                    regions.mapNotNull { region -> runCatching { region to pool.translate(region.text, language) }.getOrNull() }
+                } finally { pool.close() }
                 if (translated.isEmpty()) { status = "Falha ao traduzir."; return@launch }
                 status = "Renderizando..."
-                bitmap = withContext(Dispatchers.Default) { render(src, translated) }
+                bitmap = withContext(Dispatchers.Default) { render(source, translated) }
                 status = "${translated.size} região(ões) traduzida(s)."
-            } catch (e: Exception) {
-                status = "Falha: ${e.message ?: "erro desconhecido"}"
+            } catch (error: Exception) {
+                status = "Falha: ${error.message ?: "erro desconhecido"}"
             } finally { busy = false }
         }
     }
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Página ${page + 1} / ${pages.size}") },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Voltar") } },
-                actions = { Button(onClick = ::run, enabled = !busy) { Text(if (busy) "Traduzindo..." else "Traduzir") } }
-            )
+            TopAppBar(title = { Text("Página ${page + 1} / ${pages.size}") }, navigationIcon = { TextButton(onClick = onBack) { Text("Voltar") } }, actions = { Button(onClick = ::translatePage, enabled = !busy) { Text(if (busy) "Traduzindo..." else "Traduzir") } })
         },
         bottomBar = {
             Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -375,11 +407,7 @@ private fun Reader(pages: List<Uri>, onBack: () -> Unit) {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             if (bitmap != null) ZoomBitmap(bitmap!!) else ZoomUri(pages[page])
-            status?.let {
-                Surface(Modifier.align(Alignment.BottomCenter).padding(16.dp), tonalElevation = 4.dp) {
-                    Text(it, Modifier.padding(16.dp), fontWeight = FontWeight.Medium)
-                }
-            }
+            status?.let { message -> Surface(Modifier.align(Alignment.BottomCenter).padding(16.dp), tonalElevation = 4.dp) { Text(message, Modifier.padding(16.dp), fontWeight = FontWeight.Medium) } }
         }
     }
 }
@@ -387,35 +415,17 @@ private fun Reader(pages: List<Uri>, onBack: () -> Unit) {
 @Composable
 private fun ZoomUri(uri: Uri) {
     var scale by remember(uri) { mutableFloatStateOf(1f) }
-    var off by remember(uri) { mutableStateOf(Offset.Zero) }
-    Box(
-        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant)
-            .pointerInput(uri) { detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); off += pan } },
-        Alignment.Center
-    ) {
-        coil3.compose.AsyncImage(
-            model = uri,
-            contentDescription = "Página",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = scale, scaleY = scale, translationX = off.x, translationY = off.y)
-        )
+    var offset by remember(uri) { mutableStateOf(Offset.Zero) }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant).pointerInput(uri) { detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); offset += pan } }, Alignment.Center) {
+        coil3.compose.AsyncImage(model = uri, contentDescription = "Página", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y))
     }
 }
 
 @Composable
-private fun ZoomBitmap(b: Bitmap) {
-    var scale by remember(b) { mutableFloatStateOf(1f) }
-    var off by remember(b) { mutableStateOf(Offset.Zero) }
-    Box(
-        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant)
-            .pointerInput(b) { detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); off += pan } },
-        Alignment.Center
-    ) {
-        Image(
-            b.asImageBitmap(),
-            contentDescription = "Página traduzida",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = scale, scaleY = scale, translationX = off.x, translationY = off.y)
-        )
+private fun ZoomBitmap(bitmap: Bitmap) {
+    var scale by remember(bitmap) { mutableFloatStateOf(1f) }
+    var offset by remember(bitmap) { mutableStateOf(Offset.Zero) }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant).pointerInput(bitmap) { detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); offset += pan } }, Alignment.Center) {
+        Image(bitmap.asImageBitmap(), contentDescription = "Página traduzida", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y))
     }
 }
