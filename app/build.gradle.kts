@@ -11,8 +11,8 @@ android {
         applicationId = "com.manhuatranslator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.9.3"
+        versionCode = 22
+        versionName = "0.10.0"
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }
