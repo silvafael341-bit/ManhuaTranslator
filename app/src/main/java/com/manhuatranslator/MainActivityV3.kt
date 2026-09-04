@@ -100,9 +100,16 @@ private class V3Ocr : AutoCloseable {
     }
 
     private fun selectBest(all: List<V3Block>): List<V3Block> {
+        val cjkCandidates = all.filter { it.script != V3Script.LATIN && it.text.count(::isCjk) >= 2 }
         val ordered = all.sortedByDescending { blockScore(it) }
         val kept = mutableListOf<V3Block>()
         for (candidate in ordered) {
+            // Em uma página de manhua, um resultado Latin sobre a mesma área de um
+            // resultado CJK quase sempre é uma falsa leitura do desenho/onomatopeia.
+            if (candidate.script == V3Script.LATIN && cjkCandidates.any {
+                    overlap(it.box, candidate.box) > 0.30f && it.confidence >= candidate.confidence * 0.70f
+                }) continue
+
             val duplicate = kept.any {
                 overlap(it.box, candidate.box) > 0.55f &&
                     (normalize(it.text) == normalize(candidate.text) || overlap(it.box, candidate.box) > 0.82f)
@@ -116,7 +123,13 @@ private class V3Ocr : AutoCloseable {
         val chars = b.text.count { !it.isWhitespace() }
         val cjk = b.text.count(::isCjk)
         val latin = b.text.count { it.isLetter() && it.code < 256 }
-        return b.confidence * 100.0 + cjk * 16.0 + chars * 1.5 - latin * if (cjk == 0) 0.15 else 0.0
+        val scriptBonus = when (b.script) {
+            V3Script.CHINESE -> 20.0
+            V3Script.JAPANESE -> 18.0
+            V3Script.KOREAN -> 18.0
+            V3Script.LATIN -> 0.0
+        }
+        return b.confidence * 100.0 + cjk * 18.0 + chars * 1.5 + scriptBonus - latin * if (cjk == 0) 0.25 else 0.0
     }
 
     private fun isCjk(c: Char) = c.code in 0x3040..0x30FF || c.code in 0x3400..0x9FFF || c.code in 0xAC00..0xD7AF
@@ -226,48 +239,80 @@ private fun v3Render(original: Bitmap, translated: List<Pair<V3Region, String>>)
     for ((region, text) in translated) {
         if (text.isBlank()) continue
         val background = v3Background(original, region.box)
-        val area = v3SafeArea(original, region.box, background)
+        val area = v3SafeArea(original, region.box)
         val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = background }
 
-        // Primeiro limpa somente a região onde o OCR encontrou o texto original.
-        // Isso evita deixar caracteres antigos por baixo da tradução.
+        // Limpa somente uma faixa um pouco maior que o texto OCR.
+        // Nao preenche o oval inteiro: isso preserva o branco original do balao
+        // e impede o aparecimento do oval cinza visto na V3.
         val erase = RectF(region.box).apply {
-            inset(-max(10f, region.box.width() * 0.08f), -max(10f, region.box.height() * 0.15f))
+            inset(-max(14f, region.box.width() * 0.22f), -max(12f, region.box.height() * 0.35f))
         }
         canvas.save()
         canvas.clipPath(area.path)
         canvas.drawRect(erase, fill)
         canvas.restore()
 
-        // Depois limpa o restante da área segura e desenha a tradução dentro dela.
-        canvas.save()
-        canvas.clipPath(area.path)
-        canvas.drawRect(area.bounds, fill)
-        canvas.restore()
         v3DrawText(canvas, area, text, background)
     }
     return output
 }
 
 private fun v3Background(bitmap: Bitmap, box: Rect): Int {
-    val points = mutableListOf<Pair<Int, Int>>()
-    val px = max(12, box.width() / 3)
-    val py = max(12, box.height() / 2)
-    points += box.centerX() to box.centerY()
-    points += box.left + px to box.top + py
-    points += box.right - px to box.top + py
-    points += box.left + px to box.bottom - py
-    points += box.right - px to box.bottom - py
-    points += box.centerX() to (box.top - py).coerceAtLeast(0)
-    points += box.centerX() to (box.bottom + py).coerceAtMost(bitmap.height - 1)
-    val samples = points.filter { it.first in 0 until bitmap.width && it.second in 0 until bitmap.height }
-        .map { bitmap.getPixel(it.first, it.second) }
-    val light = samples.filter { luma(it) >= 180.0 }
-    val source = if (light.isNotEmpty()) light else samples
-    return source.groupBy { quantize(it) }.maxByOrNull { it.value.size }?.value?.firstOrNull() ?: Color.WHITE
+    val left = (box.left - box.width() / 2).coerceAtLeast(0)
+    val top = (box.top - box.height() / 2).coerceAtLeast(0)
+    val right = (box.right + box.width() / 2).coerceAtMost(bitmap.width - 1)
+    val bottom = (box.bottom + box.height() / 2).coerceAtMost(bitmap.height - 1)
+
+    val bright = mutableListOf<Int>()
+    val all = mutableListOf<Int>()
+    val stepX = max(3, (right - left) / 14)
+    val stepY = max(3, (bottom - top) / 14)
+    var y = top
+    while (y <= bottom) {
+        var x = left
+        while (x <= right) {
+            val c = bitmap.getPixel(x, y)
+            val lum = luma(c)
+            all += c
+            if (lum >= 225.0) bright += c
+            x += stepX
+        }
+        y += stepY
+    }
+
+    // Se existe uma quantidade significativa de pixels quase brancos no interior,
+    // o balao e branco. Use branco puro para remover texto sem criar uma mancha cinza.
+    if (bright.size >= max(8, all.size / 5)) {
+        val avg = brightAverage(bright)
+        if (luma(avg) >= 235.0) return Color.WHITE
+        return avg
+    }
+
+    val light = all.filter { luma(it) >= 180.0 }
+    val source = if (light.isNotEmpty()) light else all
+    return medianColor(source)
 }
 
-private fun v3SafeArea(bitmap: Bitmap, source: Rect, background: Int): V3Area {
+private fun brightAverage(colors: List<Int>): Int {
+    if (colors.isEmpty()) return Color.WHITE
+    val r = colors.sumOf { Color.red(it) }.toDouble() / colors.size
+    val g = colors.sumOf { Color.green(it) }.toDouble() / colors.size
+    val b = colors.sumOf { Color.blue(it) }.toDouble() / colors.size
+    return Color.rgb(r.toInt().coerceIn(0, 255), g.toInt().coerceIn(0, 255), b.toInt().coerceIn(0, 255))
+}
+
+private fun medianColor(colors: List<Int>): Int {
+    if (colors.isEmpty()) return Color.WHITE
+    fun med(values: List<Int>) = values.sorted()[values.size / 2]
+    return Color.rgb(
+        med(colors.map(Color::red)),
+        med(colors.map(Color::green)),
+        med(colors.map(Color::blue))
+    )
+}
+
+private fun v3SafeArea(bitmap: Bitmap, source: Rect): V3Area {
     val cx = source.centerX().toFloat()
     val cy = source.centerY().toFloat()
     val width = min(bitmap.width.toFloat(), max(150f, source.width() * 1.65f))
@@ -281,7 +326,6 @@ private fun v3SafeArea(bitmap: Bitmap, source: Rect, background: Int): V3Area {
     val path = Path()
     val inset = min(10f, min(bounds.width(), bounds.height()) * 0.04f)
     val safe = RectF(bounds).apply { inset(inset, inset) }
-    // O oval mantém a tradução dentro do interior mesmo em balões irregulares.
     path.addOval(safe, Path.Direction.CW)
     return V3Area(path, safe)
 }
@@ -345,7 +389,6 @@ private fun v3Wrap(text: String, paint: Paint, maxWidth: Float): List<String> {
     return lines
 }
 
-private fun quantize(c: Int) = (Color.red(c) / 16 shl 8) or (Color.green(c) / 16 shl 4) or (Color.blue(c) / 16)
 private fun luma(c: Int) = .299 * Color.red(c) + .587 * Color.green(c) + .114 * Color.blue(c)
 
 @Composable private fun V3App() {
