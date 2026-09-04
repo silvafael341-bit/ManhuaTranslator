@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.manhuatranslator"
     compileSdk = 35
+
     defaultConfig {
         applicationId = "com.manhuatranslator"
         minSdk = 26
@@ -14,6 +15,15 @@ android {
         versionCode = 7
         versionName = "0.7.0"
     }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
