@@ -216,7 +216,9 @@ private fun v2DetectInterior(bitmap: Bitmap, source: Rect, background: Int): V2I
             }
             x += 2
         }
-        val merged = v2MergeRuns(runs, 16)
+        // OCR characters split the white interior into many small runs.
+        // Merge a wider gap so the original glyphs do not survive as holes in the mask.
+        val merged = v2MergeRuns(runs, 96)
         val chosen = merged.firstOrNull { cx in it.first..it.second }
             ?: merged.minByOrNull { abs(((it.first + it.second) / 2) - cx) }
         if (chosen != null && chosen.second - chosen.first >= max(20, source.width() / 3)) rows += Triple(y, chosen.first, chosen.second)
@@ -268,9 +270,9 @@ private fun v2DrawText(canvas: Canvas, interior: V2Interior, text: String, backg
         color = if (luma(background) > 150.0) Color.BLACK else Color.WHITE
         typeface = Typeface.create("sans", Typeface.NORMAL)
     }
-    val maxWidth = interior.bounds.width() * .78f
-    val maxHeight = interior.bounds.height() * .72f
-    var size = (interior.bounds.height() * .22f).coerceIn(20f, 64f)
+    val maxWidth = interior.bounds.width() * .72f
+    val maxHeight = interior.bounds.height() * .66f
+    var size = (interior.bounds.height() * .20f).coerceIn(20f, 64f)
     var lines = emptyList<String>()
     while (size >= 12f) {
         paint.textSize = size
